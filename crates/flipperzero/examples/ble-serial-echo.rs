@@ -1,57 +1,82 @@
-//! BLE Serial Echo example for Flipper Zero.
-//! While running, echos input received over BLE serial back to the sender.
-
+//! Bounded application BLE serial echo. Back exits; automatic exit after 60 seconds.
+//! Requires a central supporting Flipper serial indications and receive credits.
 #![no_main]
 #![no_std]
-
-// Required for panic handler
-extern crate flipperzero_rt;
-
-// Required for allocator
 extern crate flipperzero_alloc;
-
-use core::ffi::CStr;
-
-use flipperzero::bluetooth::serial::BleSerial;
-use flipperzero::furi::event_flag::EventFlag;
-use flipperzero::furi::time::FuriDuration;
-use flipperzero::{debug, info};
+extern crate flipperzero_rt;
+use core::{
+    ffi::{CStr, c_void},
+    ptr,
+};
+use flipperzero::{
+    bluetooth::serial::BleSerial,
+    furi::time::{FuriDuration, FuriInstant},
+    info,
+};
 use flipperzero_rt::{entry, manifest};
-
-manifest!(
-    name = "BLE Serial Echo",
-    app_version = 1,
-    has_icon = true,
-    icon = "icons/rustacean-10x10.icon",
-);
-
+use flipperzero_sys::{self as sys, furi::UnsafeRecord};
+manifest!(name = "BLE Serial Echo", app_version = 2, stack_size = 4096);
 entry!(main);
-
-const FLAG_STOP: u32 = 1 << 0;
-
-fn main(_args: Option<&CStr>) -> i32 {
-    let ble_serial = match BleSerial::start() {
-        Ok(s) => s,
-        Err(_) => {
-            info!("Failed to start BLE serial");
-            return 1;
-        }
+unsafe extern "C" fn draw(canvas: *mut sys::Canvas, _: *mut c_void) {
+    unsafe {
+        sys::canvas_draw_str(canvas, 4, 14, c"BLE serial echo".as_ptr());
+        sys::canvas_draw_str(canvas, 4, 32, c"Back exits / 60s limit".as_ptr());
+        sys::canvas_draw_str(canvas, 4, 48, c"App profile, not RPC".as_ptr());
+    }
+}
+fn main(_: Option<&CStr>) -> i32 {
+    // SAFETY: this standalone app is sole profile owner and drops the session
+    // before returning/unloading code. It invokes no other profile-changing API.
+    let mut serial = match unsafe { BleSerial::start() } {
+        Ok(serial) => serial,
+        Err(_) => return 1,
     };
-
-    info!("BLE serial started. Connect via BLE to echo data.");
-
-    let event = EventFlag::new();
-    let _receiver = ble_serial.async_receiver(|data| {
-        debug!("Received {} bytes", data.len());
-
-        // Echo input back over BLE serial
-        ble_serial.tx(data);
-    });
-
-    // Wait until stopped (e.g. via back button or BLE reset request)
-    event
-        .wait_all_flags(FLAG_STOP, false, FuriDuration::MAX)
-        .unwrap();
-
-    0
+    let view = unsafe { sys::view_port_alloc() };
+    let gui = unsafe { UnsafeRecord::<sys::Gui>::open(c"gui") };
+    unsafe {
+        sys::view_port_draw_callback_set(view, Some(draw), ptr::null_mut());
+        sys::gui_add_view_port(gui.as_ptr(), view, sys::GuiLayerFullscreen);
+    }
+    let start = FuriInstant::now();
+    let mut data = [0; 64];
+    let mut received = 0u32;
+    let mut echoed = 0u32;
+    let mut failed = false;
+    while start.elapsed() < FuriDuration::from_secs(60) {
+        // Board's Back input is active low; read without reconfiguring it.
+        if !unsafe { sys::furi_hal_gpio_read(&sys::gpio_button_back) } {
+            break;
+        }
+        match serial.read(&mut data, FuriDuration::from_millis(50)) {
+            Ok(0) => {}
+            Ok(count) => {
+                received += count as u32;
+                if serial
+                    .tx(&data[..count], FuriDuration::from_millis(500))
+                    .is_err()
+                {
+                    failed = true;
+                    break; // Delivery unknown: do not retry or silently lose data.
+                }
+                echoed += count as u32;
+            }
+            Err(_) => {
+                failed = true;
+                break;
+            }
+        }
+    }
+    info!(
+        "BLE echo received={} confirmed={} dropped={}",
+        received,
+        echoed,
+        serial.dropped_bytes()
+    );
+    unsafe {
+        sys::view_port_enabled_set(view, false);
+        sys::gui_remove_view_port(gui.as_ptr(), view);
+        sys::view_port_free(view);
+    }
+    drop(serial);
+    if failed { 1 } else { 0 }
 }
