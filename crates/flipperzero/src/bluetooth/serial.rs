@@ -16,7 +16,10 @@ use flipperzero_sys::{
     furi::{FuriBox, UnsafeRecord},
 };
 
-const CAPACITY: u16 = 2048;
+const CREDITS: u16 = 2048;
+// Empty observation and firmware credit replenishment are not one atomic operation.
+// Reserve one old window plus one newly granted window for that race.
+const CAPACITY: usize = CREDITS as usize * 2;
 const SENT: u32 = 1;
 const RESET: u32 = 2;
 /// Maximum payload accepted by the firmware serial service per indication.
@@ -40,6 +43,8 @@ struct Context {
     // Firmware casts this prefix to FuriHalBleProfileBase.
     base: sys::FuriHalBleProfileBase,
     service: AtomicPtr<sys::BleServiceSerial>,
+    dev_info: AtomicPtr<sys::BleServiceDevInfo>,
+    battery: AtomicPtr<sys::BleServiceBattery>,
     rx: StreamBuffer,
     events: EventFlag,
     dropped: AtomicU32,
@@ -80,7 +85,9 @@ impl BleSerial {
         let mut context = FuriBox::new(Context {
             base: sys::FuriHalBleProfileBase { config: &PROFILE },
             service: AtomicPtr::new(ptr::null_mut()),
-            rx: StreamBuffer::new(NonZero::new(CAPACITY as usize).unwrap(), 1),
+            dev_info: AtomicPtr::new(ptr::null_mut()),
+            battery: AtomicPtr::new(ptr::null_mut()),
+            rx: StreamBuffer::new(NonZero::new(CAPACITY).unwrap(), 1),
             events: EventFlag::new(),
             dropped: AtomicU32::new(0),
         });
@@ -212,14 +219,25 @@ unsafe extern "C" fn gap_config(config: *mut sys::GapConfig, params: *mut c_void
 
 unsafe extern "C" fn start_profile(params: *mut c_void) -> *mut sys::FuriHalBleProfileBase {
     let context = params.cast::<Context>();
+    // Match the built-in profile's service order/handles, avoiding a needless
+    // GATT layout change for centrals caching the same bonded peripheral address.
+    let dev_info = unsafe { sys::ble_svc_dev_info_start() };
+    assert!(
+        !dev_info.is_null(),
+        "BLE device information allocation failed"
+    );
+    let battery = unsafe { sys::ble_svc_battery_start(true) };
+    assert!(!battery.is_null(), "BLE battery service allocation failed");
     let service = unsafe { sys::ble_svc_serial_start() };
-    if service.is_null() {
-        return ptr::null_mut();
-    }
+    // Firmware registers the dispatcher entry before GATT allocation and fails
+    // to remove it if allocation fails. Do not recover through that stale entry.
+    assert!(!service.is_null(), "BLE serial service allocation failed");
     unsafe {
+        (*context).dev_info.store(dev_info, Ordering::Release);
+        (*context).battery.store(battery, Ordering::Release);
         (*context).service.store(service, Ordering::Release);
         // bt_change_profile starts advertising only after this callback returns.
-        sys::ble_svc_serial_set_callbacks(service, CAPACITY, Some(on_event), context.cast());
+        sys::ble_svc_serial_set_callbacks(service, CREDITS, Some(on_event), context.cast());
         sys::ble_svc_serial_set_rpc_active(service, true);
         ptr::addr_of_mut!((*context).base)
     }
@@ -230,7 +248,11 @@ unsafe extern "C" fn stop_profile(base: *mut sys::FuriHalBleProfileBase) {
     // Firmware has stopped advertising/disconnected before invoking profile stop.
     // Keep Context allocated until bt_profile_restore_default returns and joins
     // the event thread. The service owns/unregisters its event dispatcher entry.
-    unsafe { sys::ble_svc_serial_stop((*context).service.load(Ordering::Acquire)) };
+    unsafe {
+        sys::ble_svc_battery_stop((*context).battery.load(Ordering::Acquire));
+        sys::ble_svc_dev_info_stop((*context).dev_info.load(Ordering::Acquire));
+        sys::ble_svc_serial_stop((*context).service.load(Ordering::Acquire));
+    };
 }
 
 unsafe extern "C" fn on_event(event: sys::SerialServiceEvent, context: *mut c_void) -> u16 {

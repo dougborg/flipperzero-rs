@@ -49,9 +49,4 @@ impl Bluetooth {
             Self { bt }
         }
     }
-
-    /// Returns the raw pointer to the underlying `Bt` instance.
-    pub fn as_ptr(&self) -> *mut sys::Bt {
-        self.bt.as_ptr()
-    }
 }

@@ -5,6 +5,9 @@ or a client for the Flipper RPC service. It uses a distinct profile template and
 advertises `BLE Serial App`. Firmware RPC only registers its callbacks when the
 active template is `ble_profile_serial`, so it does not own this callback slot.
 The GATT serial UUIDs and credit/indication protocol remain Flipper-compatible.
+Device-info, battery and serial services retain the default allocation order to
+avoid changing cached handles for the existing peripheral identity. Runtime
+cache/rediscovery behavior must still be validated on each central platform.
 
 This revision replaces the original borrowed asynchronous receiver with an owned,
 polled session. `read(&mut self, ...)` has one reader; the BLE event thread is the
@@ -14,7 +17,8 @@ exclusively own the global profile and drop it before application code unloads.
 The firmware record API cannot enforce that global lease. Never run Bluetooth
 test modes or another profile-changing API while holding this session.
 
-Receive capacity is 2,048 bytes. Firmware credits are replenished when the queue
+Receive storage is 4,096 bytes, with 2,048 advertised credits. One extra window
+absorbs a receive racing between the empty observation and credit replenishment. Firmware credits are replenished when the queue
 is drained. Peers must honor credits; `dropped_bytes()` reports rejected bytes if
 they do not. Callback return is remaining capacity. `tx` limits packets to the
 firmware's 486-byte maximum and waits for an indication confirmation. A timeout
@@ -31,7 +35,9 @@ Exact firmware commit: `e1784e7418d8b074e971983ceb6fef0f37e52ae4`, API87.1.
 1. `bt_profile_start` synchronously sends a profile-change request to the BT
    service. `bt_change_profile` only starts advertising after `start` returns.
    The start hook allocates the serial service and installs its callback/context
-   before returning. There is no live callback replacement.
+   before returning. There is no live callback replacement. Service-allocation
+   failure is fail-stop: the firmware serial-service allocator can leave a dangling
+   dispatcher entry on failure, so normal recovery is not sound.
 2. Drop calls `bt_profile_restore_default` synchronously, keeping Context alive.
    The firmware's `furi_hal_bt_change_app` calls `furi_hal_bt_reinit`, which stops
    advertising/disconnects, calls our stop hook to unregister/destroy the serial
@@ -55,6 +61,9 @@ From `crates`, build `cargo build -p flipperzero --example ble-serial-echo --fea
 Run `python3 scripts/check-ble-contracts.py` from the repository root with Cargo
 and the ARM toolchain on PATH. It verifies that safe construction, moving/sharing
 across threads, and immutable I/O are rejected by the compiler.
+`python3 scripts/check-ble-credit-window.py` exhaustively models small credit
+windows and all read/receive/notify interleavings, reproducing the one-window
+overflow and verifying the two-window bound for credit-honoring peers.
 
 The API87.1 artifact must be built with SDK0.16.0, not the current SDK0.17.0/API88.2.
 Never modify only the manifest to bypass firmware API compatibility checks.
