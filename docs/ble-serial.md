@@ -80,7 +80,8 @@ overflow and verifying the two-window bound for credit-honoring peers.
 The API87.1 artifact must be built with SDK0.16.0, not the current SDK0.17.0/API88.2.
 Never modify only the manifest to bypass firmware API compatibility checks.
 Hardware validation on 2026-11-21 used the SDK0.16/API87.1 build of source
-`05b9bc9`, SHA256
+[`05b9bc9`](https://github.com/dougborg/flipperzero-rs/tree/ble-serial-api87-tested),
+retained on `ble-serial-api87-tested`, SHA256
 `89267f3a258e1de855247371c8799e1c3e7440027be34be714c352667f0fd3f1`,
 on Momentum mntm-012. The corresponding rebased SDK0.17 source builds, but was
 not installed on the API87.1 device.
