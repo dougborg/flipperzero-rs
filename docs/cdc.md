@@ -78,7 +78,7 @@ The ownership and callback behavior was checked against
 [its CLI service](https://github.com/Next-Flip/Momentum-Firmware/blob/mntm-012/applications/services/cli/cli_vcp.c),
 and the corresponding official firmware sources. Callback slots survive CDC
 interface reinitialization; mode selection alone does not transfer ownership.
-No on-device acceptance results are recorded yet.
+See the bounded on-device acceptance results below.
 
 ## Software checks
 
@@ -111,7 +111,7 @@ synchronous payload loss. Subsequent tests echoed 1, 7, and 63 bytes exactly, bu
 64-byte packet did not terminate the host read. The firmware CLI implements the
 same necessary rule: after a full 64-byte data completion, submit a ZLP if there
 is no further data. The revised TX state machine implements that rule and awaits
-both completions; its hardware acceptance remains pending. All those earlier
+both completions; the bounded acceptance runs below pass. All those earlier
 bounded runs restored the original CLI. These findings do not establish single
 mode, sustained throughput, or disconnect recovery.
 
@@ -119,3 +119,36 @@ mode, sustained throughput, or disconnect recovery.
 state module: initial enumeration, short packet, full packet plus ZLP, retained
 unknown pending transfer, and terminal disconnect. These are transition tests,
 not simulations of USB hardware or interrupt timing.
+
+## Bounded acceptance on macOS / Momentum mntm-012
+
+Two consecutive runs passed using source commit `09f7e55` and SDK 0.16.0,
+with the device's existing Momentum mntm-012 firmware (API 87.1) unchanged.
+The FAP SHA256 was
+`111a8a7333c027cf0a436105a27d782eec2658dfacfa0628130fd69348230570`.
+The exact firmware export audit passed all 52 imports for hardware target 7.
+
+Both runs verified:
+
+- Application CDC interface identified separately from the firmware CLI.
+- Exact stop-and-wait echoes of 1, 7, 63, and 64 bytes, including full-packet termination.
+- Explicit async READY handshake, then 256 bytes sent as two 128-byte host writes.
+- Exact async count response of 256 (count verification, not async payload integrity).
+- Automatic restoration of the original USB interface and a responsive idle CLI.
+
+A separate run with no host traffic also restored the idle CLI automatically.
+The observer measured 38.1 seconds including USB enumeration and polling, against
+an app deadline of 35 seconds plus firmware restoration. This validates unattended
+expiry without claiming a precise wall-clock teardown guarantee.
+
+The code received independent agent review before device testing, including callback
+storage lifetime, mode ownership, STOP responsiveness, and completion/ZLP state.
+
+Reproduce the payload checks with `scripts/test-cdc-echo.py APPLICATION_PORT`,
+then independently verify CLI restoration. The test script sends only synthetic
+payloads. The on-device build must use SDK 0.16/API 87.1; SDK 0.17 compatibility is
+checked separately and its binary must not be substituted on this device.
+
+These bounded runs do not establish single-port CLI handoff, physical unplug,
+sleep/wake, sustained throughput, queue-overflow recovery, or endurance. Heap
+readings varied between runs; no leak-free or runtime memory-budget claim is made.
