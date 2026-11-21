@@ -22,9 +22,12 @@ const CREDITS: u16 = 2048;
 const CAPACITY: usize = CREDITS as usize * 2;
 const SENT: u32 = 1;
 const RESET: u32 = 2;
-/// Maximum payload accepted by the firmware serial service per indication.
-// BLE_SVC_SERIAL_DATA_LEN_MAX in the firmware serial_service.h (SDK 87.1/88.2).
-pub const MAX_PACKET_SIZE: usize = 486;
+/// Conservative indication payload for the default ATT MTU (23 minus 3 bytes).
+///
+/// The firmware characteristic can hold 486 bytes, but that is not the negotiated
+/// ATT payload. This wrapper does not own the firmware MTU callback, so larger
+/// writes must be split by the caller rather than relying on truncation behavior.
+pub const MAX_PACKET_SIZE: usize = 20;
 
 /// Session or transmit error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -9,7 +9,7 @@ use core::{
     ptr,
 };
 use flipperzero::{
-    bluetooth::serial::BleSerial,
+    bluetooth::serial::{BleSerial, MAX_PACKET_SIZE},
     furi::time::{FuriDuration, FuriInstant},
     info,
 };
@@ -38,7 +38,7 @@ fn main(_: Option<&CStr>) -> i32 {
         sys::gui_add_view_port(gui.as_ptr(), view, sys::GuiLayerFullscreen);
     }
     let start = FuriInstant::now();
-    let mut data = [0; 64];
+    let mut data = [0; MAX_PACKET_SIZE];
     let mut received = 0u32;
     let mut echoed = 0u32;
     let mut failed = false;

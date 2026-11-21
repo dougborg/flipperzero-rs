@@ -21,7 +21,10 @@ Receive storage is 4,096 bytes, with 2,048 advertised credits. One extra window
 absorbs a receive racing between the empty observation and credit replenishment. Firmware credits are replenished when the queue
 is drained. Peers must honor credits; `dropped_bytes()` reports rejected bytes if
 they do not. Callback return is remaining capacity. `tx` limits packets to the
-firmware's 486-byte maximum and waits for an indication confirmation. A timeout
+default ATT payload of 20 bytes and waits for an indication confirmation. The
+characteristic's 486-byte storage limit does not establish negotiated MTU; larger
+application writes must be split into <=20-byte calls. The echo example drains
+20-byte chunks even when the central writes a larger RX payload. A timeout
 means delivery is unknown, not failed; pending confirmation is retained and a
 second indication is not submitted until it arrives. A failed low-level TX is
 also conservatively left pending. Reload the session after an unrecoverable
