@@ -31,6 +31,17 @@ pub enum Error {
     UsbLocked,
 }
 
+// The firmware updates its cached DTR/RTS state only when a non-null callback
+// table is installed. Keep one installed even for synchronous-only sessions.
+// Static storage survives enumeration and every synchronous method call.
+static IDLE_CALLBACKS: sys::CdcCallbacks = sys::CdcCallbacks {
+    tx_ep_callback: None,
+    rx_ep_callback: None,
+    state_callback: None,
+    ctrl_line_callback: None,
+    config_callback: None,
+};
+
 /// RAII handle to a USB CDC interface.
 ///
 /// Saves the previous USB configuration on creation and restores it on drop.
@@ -71,7 +82,16 @@ impl UsbCdc {
                 CdcMode::Dual => (&raw mut sys::usb_cdc_dual, 1),
             };
 
+            // Install before enumeration: SET_CONTROL_LINE_STATE can arrive as
+            // soon as the host opens the newly exposed interface. The constructor
+            // contract guarantees this channel has no previous callback owner.
+            set_callbacks(
+                if_num,
+                (&raw const IDLE_CALLBACKS).cast_mut(),
+                ptr::null_mut(),
+            );
             if !sys::furi_hal_usb_set_config(usb_if, ptr::null_mut()) {
+                set_callbacks(if_num, ptr::null_mut(), ptr::null_mut());
                 return Err(Error::UsbLocked);
             }
 

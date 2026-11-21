@@ -29,6 +29,13 @@ fn main(_args: Option<&CStr>) -> i32 {
     let duration = unsafe { sys::furi_ms_to_ticks(35_000) };
     let mut buffer = [0u8; 64];
     while unsafe { sys::furi_get_tick() }.wrapping_sub(start) < duration {
+        // Do not consume and discard a packet while the host's DTR request is
+        // still in flight. The CDC wrapper installs callbacks before enumeration
+        // so the firmware caches control-line state even in synchronous mode.
+        if !cdc.ctrl_line_state().dtr() {
+            unsafe { sys::furi_delay_ms(2) };
+            continue;
+        }
         let count = cdc.rx(&mut buffer);
         // A reserved one-byte EOT packet switches to async. No test payload is EOT.
         if count == 1 && buffer[0] == 0x04 {
@@ -36,7 +43,7 @@ fn main(_args: Option<&CStr>) -> i32 {
         }
         // The host must send one packet at a time, waiting for the exact echo
         // before sending the next. This is not a throughput benchmark.
-        if count != 0 && cdc.ctrl_line_state().dtr() {
+        if count != 0 {
             cdc.tx(&buffer[..count]);
         }
         unsafe { sys::furi_delay_ms(2) };
