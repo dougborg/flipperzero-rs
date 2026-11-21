@@ -41,6 +41,11 @@ impl Drop for Bluetooth {
 }
 
 impl Bluetooth {
+    /// Returns the raw pointer to the underlying `Bt` instance.
+    pub fn as_ptr(&self) -> *mut sys::Bt {
+        self.bt.as_ptr()
+    }
+
     /// Obtains a handle to the Bluetooth service.
     pub(crate) fn open() -> Self {
         unsafe {
