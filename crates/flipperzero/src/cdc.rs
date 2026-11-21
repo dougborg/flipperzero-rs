@@ -1,6 +1,6 @@
 //! USB CDC (Communications Device Class) wrapper.
 //!
-//! This module provides a safe Rust interface to the Flipper Zero's USB CDC serial port,
+//! This module provides a Rust interface to the Flipper Zero's USB CDC serial port,
 //! allowing apps to communicate with a host computer over USB as a virtual serial device.
 
 use core::ffi::c_void;
@@ -47,7 +47,18 @@ impl UsbCdc {
     /// USB configuration is saved and will be restored when this handle is dropped.
     ///
     /// Returns [`Error::UsbLocked`] if the USB mode is already locked by another component.
-    pub fn enable(mode: CdcMode) -> Result<Self, Error> {
+    ///
+    /// # Safety
+    ///
+    /// The caller must exclusively coordinate USB configuration with all other firmware
+    /// components for the entire handle lifetime. HAL's check/switch/lock operations are
+    /// separate calls, not an atomic ownership claim. The selected CDC channel must have
+    /// no existing callbacks or users (in single mode, explicitly stop the firmware CLI
+    /// first). The previous interface must support restoration with a null context;
+    /// HAL exposes no getter for its original context. The caller must restore any CLI
+    /// session it stopped after dropping this handle. Do not unload the application
+    /// while a leaked handle or receiver is still active.
+    pub unsafe fn enable(mode: CdcMode) -> Result<Self, Error> {
         unsafe {
             if sys::furi_hal_usb_is_locked() {
                 return Err(Error::UsbLocked);
@@ -75,11 +86,19 @@ impl UsbCdc {
 
     /// Send data over USB CDC.
     ///
+    /// This submits one endpoint packet, not a reliable stream write. The caller must
+    /// wait for endpoint completion before submitting another packet; HAL does not
+    /// report whether a busy/disconnected endpoint accepted the data.
+    ///
     /// # Panics
     ///
-    /// Panics if `data.len()` exceeds `u16::MAX`.
+    /// Panics if `data.len()` exceeds the 64-byte full-speed bulk endpoint size.
     pub fn tx(&self, data: &[u8]) {
-        let len: u16 = data.len().try_into().expect("data length exceeds u16::MAX");
+        assert!(
+            data.len() <= CDC_WORKER_BUFFER_LEN,
+            "CDC packet exceeds 64 bytes"
+        );
+        let len = data.len() as u16;
         unsafe { sys::furi_hal_cdc_send(self.if_num, data.as_ptr() as *mut u8, len) }
     }
 
@@ -91,32 +110,48 @@ impl UsbCdc {
     ///
     /// Panics if `buf.len()` exceeds `u16::MAX`.
     pub fn rx(&self, buf: &mut [u8]) -> usize {
-        let max_len: u16 = buf.len().try_into().expect("buffer length exceeds u16::MAX");
-        let received =
-            unsafe { sys::furi_hal_cdc_receive(self.if_num, buf.as_mut_ptr(), max_len) };
+        let max_len: u16 = buf
+            .len()
+            .try_into()
+            .expect("buffer length exceeds u16::MAX");
+        let received = unsafe { sys::furi_hal_cdc_receive(self.if_num, buf.as_mut_ptr(), max_len) };
         // furi_hal_cdc_receive returns i32; negative means no data
         if received < 0 { 0 } else { received as usize }
     }
 
     /// Get the current line coding (baud rate, parity, etc.) set by the host.
     pub fn line_coding(&self) -> LineCoding {
-        let ptr = unsafe { sys::furi_hal_cdc_get_port_settings(self.if_num) };
-        // SAFETY: The firmware returns a valid pointer to a static struct.
-        // We use read_unaligned because usb_cdc_line_coding is repr(C, packed).
-        unsafe { LineCoding::from_raw(ptr) }
+        // USB control requests update this packed static value from interrupt context.
+        // Exclude those writes while copying, not merely unaligned access.
+        unsafe {
+            let critical = sys::__furi_critical_enter();
+            let result = LineCoding::from_raw(sys::furi_hal_cdc_get_port_settings(self.if_num));
+            sys::__furi_critical_exit(critical);
+            result
+        }
     }
 
     /// Get the current control line state (DTR/RTS) set by the host.
     pub fn ctrl_line_state(&self) -> CtrlLineState {
-        let state = unsafe { sys::furi_hal_cdc_get_ctrl_line_state(self.if_num) };
-        CtrlLineState(state)
+        unsafe {
+            let critical = sys::__furi_critical_enter();
+            let state = sys::furi_hal_cdc_get_ctrl_line_state(self.if_num);
+            sys::__furi_critical_exit(critical);
+            CtrlLineState(state)
+        }
     }
 
     /// Create an async receiver for incoming USB CDC data.
     ///
     /// The provided callback will be invoked with received data on a dedicated worker thread.
-    /// The receiver is active until dropped.
-    pub fn async_receiver<F: FnMut(&[u8])>(&self, on_rx: F) -> AsyncCdcReceiver<'_, F> {
+    /// The receiver is active until dropped and takes ownership of this handle. This
+    /// prevents concurrent receivers and synchronous reads competing for the endpoint.
+    /// Captures must be owned (`Send + 'static`) because forgetting a receiver must
+    /// not leave the worker accessing expired stack references.
+    ///
+    /// The callback must return promptly so dropping the receiver can join the worker.
+    /// The 2048-byte queue is bounded; excess input is currently discarded.
+    pub fn async_receiver<F: FnMut(&[u8]) + Send + 'static>(self, on_rx: F) -> AsyncCdcReceiver<F> {
         AsyncCdcReceiver::new(self, on_rx)
     }
 }
@@ -124,7 +159,7 @@ impl UsbCdc {
 impl Drop for UsbCdc {
     fn drop(&mut self) {
         // Clear CDC callbacks so they no longer reference any context.
-        unsafe { sys::furi_hal_cdc_set_callbacks(self.if_num, ptr::null_mut(), ptr::null_mut()) };
+        unsafe { set_callbacks(self.if_num, ptr::null_mut(), ptr::null_mut()) };
 
         // Unlock and restore the previous USB configuration.
         unsafe {
@@ -276,15 +311,15 @@ impl WorkerEvent {
 /// Async receiver that dispatches incoming USB CDC data via callback.
 ///
 /// This spawns a dedicated worker thread to dispatch received data.
-pub struct AsyncCdcReceiver<'a, F>
+pub struct AsyncCdcReceiver<F>
 where
-    F: FnMut(&[u8]),
+    F: FnMut(&[u8]) + Send + 'static,
 {
-    usb_cdc: &'a UsbCdc,
+    usb_cdc: UsbCdc,
     context: FuriBox<Context<F>>,
 }
 
-struct Context<F: FnMut(&[u8])> {
+struct Context<F: FnMut(&[u8]) + Send + 'static> {
     rx_stream: StreamBuffer,
     on_rx: F,
     worker_thread: AtomicPtr<sys::FuriThread>,
@@ -292,11 +327,11 @@ struct Context<F: FnMut(&[u8])> {
     cdc_callbacks: sys::CdcCallbacks,
 }
 
-impl<'a, F> AsyncCdcReceiver<'a, F>
+impl<F> AsyncCdcReceiver<F>
 where
-    F: FnMut(&[u8]),
+    F: FnMut(&[u8]) + Send + 'static,
 {
-    fn new(usb_cdc: &'a UsbCdc, on_rx: F) -> Self {
+    fn new(usb_cdc: UsbCdc, on_rx: F) -> Self {
         let rx_stream = StreamBuffer::new(NonZero::new(2048).unwrap(), 1);
 
         let mut context = FuriBox::new(Context {
@@ -335,7 +370,7 @@ where
             // since it doesn't create an intermediate reference. We pass a pointer to
             // the `cdc_callbacks` field inside the FuriBox-allocated Context.
             let context_ptr = FuriBox::as_mut_ptr(&mut context);
-            sys::furi_hal_cdc_set_callbacks(
+            set_callbacks(
                 usb_cdc.if_num,
                 &raw mut (*context_ptr).cdc_callbacks,
                 context_ptr.cast(),
@@ -346,15 +381,11 @@ where
     }
 }
 
-impl<F: FnMut(&[u8])> Drop for AsyncCdcReceiver<'_, F> {
+impl<F: FnMut(&[u8]) + Send + 'static> Drop for AsyncCdcReceiver<F> {
     fn drop(&mut self) {
         // Clear the callback so it no longer references `Context`.
         unsafe {
-            sys::furi_hal_cdc_set_callbacks(
-                self.usb_cdc.if_num,
-                ptr::null_mut(),
-                ptr::null_mut(),
-            );
+            set_callbacks(self.usb_cdc.if_num, ptr::null_mut(), ptr::null_mut());
         }
 
         // SAFETY: Worker thread is still running, so be careful not to create a reference to `Context`.
@@ -367,10 +398,10 @@ impl<F: FnMut(&[u8])> Drop for AsyncCdcReceiver<'_, F> {
             thread::set_flags(thread_id, WorkerEvent::FLAG_STOP).unwrap();
 
             unsafe {
+                sys::furi_thread_join(worker_thread);
                 (*context)
                     .worker_thread
                     .store(ptr::null_mut(), Ordering::Release);
-                sys::furi_thread_join(worker_thread);
                 sys::furi_thread_free(worker_thread);
             }
         }
@@ -383,7 +414,7 @@ const CDC_WORKER_BUFFER_LEN: usize = 64;
 ///
 /// Pulls available data from the CDC endpoint and writes it into the stream buffer,
 /// then signals the worker thread.
-unsafe extern "C" fn cdc_rx_callback<F: FnMut(&[u8])>(context: *mut c_void) {
+unsafe extern "C" fn cdc_rx_callback<F: FnMut(&[u8]) + Send + 'static>(context: *mut c_void) {
     let context = context.cast_const() as *const Context<F>;
 
     // Pull data from the CDC endpoint.
@@ -405,7 +436,9 @@ unsafe extern "C" fn cdc_rx_callback<F: FnMut(&[u8])>(context: *mut c_void) {
     }
 }
 
-unsafe extern "C" fn async_cdc_receiver_worker<F: FnMut(&[u8])>(context: *mut c_void) -> i32 {
+unsafe extern "C" fn async_cdc_receiver_worker<F: FnMut(&[u8]) + Send + 'static>(
+    context: *mut c_void,
+) -> i32 {
     debug!("Starting CDC async worker");
     assert!(!context.is_null());
     let context = context.cast::<Context<F>>();
@@ -436,4 +469,18 @@ unsafe extern "C" fn async_cdc_receiver_worker<F: FnMut(&[u8])>(context: *mut c_
     }
 
     0
+}
+
+// SAFETY: Only used for the exclusively owned CDC channel. Both the old and new
+// callback sets are ours (or null); our state/control callbacks are absent and
+// therefore registration cannot block. On the single-core STM32WB application
+// CPU, the critical section excludes USB interrupts and task switches so an
+// interrupt cannot observe a new callback pointer paired with the old context,
+// and unregister returns after all prior callbacks have finished.
+unsafe fn set_callbacks(if_num: u8, callbacks: *mut sys::CdcCallbacks, context: *mut c_void) {
+    unsafe {
+        let critical = sys::__furi_critical_enter();
+        sys::furi_hal_cdc_set_callbacks(if_num, callbacks, context);
+        sys::__furi_critical_exit(critical);
+    }
 }
