@@ -44,13 +44,12 @@ fn main(_args: Option<&CStr>) -> i32 {
         }
         // The host must send one packet at a time, waiting for the exact echo
         // before sending the next. This is not a throughput benchmark.
-        if count != 0 {
-            if cdc
+        if count != 0
+            && cdc
                 .tx(&buffer[..count], FuriDuration::from_millis(1000))
                 .is_err()
-            {
-                return 3;
-            }
+        {
+            return 3;
         }
         unsafe { sys::furi_delay_ms(2) };
     }
