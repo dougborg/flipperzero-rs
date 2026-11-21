@@ -331,6 +331,13 @@ impl<F> AsyncCdcReceiver<F>
 where
     F: FnMut(&[u8]) + Send + 'static,
 {
+    /// Submit one endpoint packet while async reception is active.
+    ///
+    /// This has the same size and delivery limitations as [`UsbCdc::tx`].
+    pub fn tx(&self, data: &[u8]) {
+        self.usb_cdc.tx(data);
+    }
+
     fn new(usb_cdc: UsbCdc, on_rx: F) -> Self {
         let rx_stream = StreamBuffer::new(NonZero::new(2048).unwrap(), 1);
 
@@ -456,6 +463,13 @@ unsafe extern "C" fn async_cdc_receiver_worker<F: FnMut(&[u8]) + Send + 'static>
 
         if events.is_rx_data() {
             loop {
+                // Observe STOP between callbacks without clearing DATA. A new DATA
+                // notification racing the final empty read remains pending for the
+                // outer wait. Drop detaches the producer first, but need not wait
+                // for the whole queued backlog to be delivered before joining.
+                if WorkerEvent(thread::get_flags().unwrap_or(0)).is_stop() {
+                    return 0;
+                }
                 let mut data = [0u8; CDC_WORKER_BUFFER_LEN];
                 let len = unsafe { (*context).rx_stream.receive(&mut data, FuriDuration::ZERO) };
 
