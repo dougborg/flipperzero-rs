@@ -79,7 +79,48 @@ overflow and verifying the two-window bound for credit-honoring peers.
 
 The API87.1 artifact must be built with SDK0.16.0, not the current SDK0.17.0/API88.2.
 Never modify only the manifest to bypass firmware API compatibility checks.
-No hardware validation is claimed yet.
+Hardware validation on 2026-11-21 used the SDK0.16/API87.1 build of source
+`05b9bc9`, SHA256
+`89267f3a258e1de855247371c8799e1c3e7440027be34be714c352667f0fd3f1`,
+on Momentum mntm-012. The corresponding rebased SDK0.17 source builds, but was
+not installed on the API87.1 device.
+
+Observed results:
+
+- Load and 60-second automatic exit restored the normal USB CLI with no app running.
+- Exact 1-, 20- and 64-byte echoes passed twice.
+- Exact 2,048-byte echo, settled/full-credit-boundary disconnect/reconnect, and
+  exact 4,096-byte echo passed in one application session. Host sent/received
+  counters matched; grants were [2048] then [2048, 2048]. Both disconnects had
+  a full outstanding window and the application still running. Automatic exit
+  then restored the CLI again.
+- The firmware's dropped-byte counter was not captured; exact echoes do not
+  establish a universal zero-drop guarantee. Physical Back, forced reset, arbitrary
+  reconnect with leftover credits, and broader OS/firmware coverage remain open.
+- An earlier load attempt deadlocked in the host harness by waiting for a
+  20-byte chunk with only 8 credits left. The corrected sender consumes the
+  residual credits. An immediate-disconnect reconnect attempt did not rediscover
+  the app; the passing run adds a final-ACK settle and checks the loader before
+  disconnect. That earlier failure is not claimed as independently diagnosed.
+- CoreBluetooth did not expose GAP Device Name (2A00). The test instead required
+  the fresh exact app advertisement, connected peripheral name, expected serial
+  characteristics, and an independent USB loader-live check before payloads.
+  A sticky disconnect latch prevented reconnecting automatically to default RPC.
+
+For a repeatable central-side test, install `bleak` and `pyserial` in an isolated
+Python environment, start the example, then run:
+
+```sh
+python scripts/test-ble-echo.py --cli-port /path/to/flipper-cli-port
+```
+
+The script takes optional `--device`, `--name` and `--app-name` selectors for a
+uniquely identified test app, not the default RPC service. It neither uploads nor
+launches apps; reserve exclusive USB access and verify final loader/CLI restoration
+separately. It runs at most 50 seconds and reports byte counts without identifiers.
+The portable script was factored from the successful local harness; its syntax
+and help entry point were checked, but this exact refactoring was not rerun on
+hardware. The private upload/restoration orchestration is not a runtime dependency.
 
 ## Bounded hardware acceptance
 
