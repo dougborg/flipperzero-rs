@@ -6,6 +6,7 @@ extern crate flipperzero_rt;
 use core::ffi::CStr;
 use core::sync::atomic::{AtomicU32, Ordering};
 use flipperzero::cdc::{CdcMode, UsbCdc};
+use flipperzero::furi::time::FuriDuration;
 use flipperzero_rt::{entry, manifest};
 use flipperzero_sys as sys;
 
@@ -44,7 +45,12 @@ fn main(_args: Option<&CStr>) -> i32 {
         // The host must send one packet at a time, waiting for the exact echo
         // before sending the next. This is not a throughput benchmark.
         if count != 0 {
-            cdc.tx(&buffer[..count]);
+            if cdc
+                .tx(&buffer[..count], FuriDuration::from_millis(1000))
+                .is_err()
+            {
+                return 3;
+            }
         }
         unsafe { sys::furi_delay_ms(2) };
     }
@@ -58,7 +64,12 @@ fn main(_args: Option<&CStr>) -> i32 {
     let receiver = cdc.async_receiver(|bytes| {
         RECEIVED.fetch_add(bytes.len() as u32, Ordering::Relaxed);
     });
-    receiver.tx(b"CDC-ASYNC-256\n");
+    if receiver
+        .tx(b"CDC-ASYNC-256\n", FuriDuration::from_millis(1000))
+        .is_err()
+    {
+        return 4;
+    }
     while RECEIVED.load(Ordering::Relaxed) < 256
         && unsafe { sys::furi_get_tick() }.wrapping_sub(start) < duration
     {
@@ -70,9 +81,12 @@ fn main(_args: Option<&CStr>) -> i32 {
         // completed before this response. Host sends nothing after that payload.
         let mut reply = *b"CDC!\0\0\0\0";
         reply[4..].copy_from_slice(&count.to_le_bytes());
-        receiver.tx(&reply);
-        // Bounded grace for response delivery; this is not completion feedback.
-        unsafe { sys::furi_delay_ms(100) };
+        if receiver
+            .tx(&reply, FuriDuration::from_millis(1000))
+            .is_err()
+        {
+            return 5;
+        }
     }
     drop(receiver);
     0

@@ -21,9 +21,13 @@ than an atomic channel lease. Its safety requirements apply until teardown.
 - Async reception consumes the handle. Its callback must own its captures,
   implement `Send`, and return promptly. Forgetting it leaks the worker and USB
   lease; never unload a FAP while a leaked worker remains active.
-- The 2048-byte receive queue can overflow. TX submits at most one 64-byte packet
-  without completion or acceptance feedback; disconnected/busy writes may be
-  lost. This is not yet a reliable serial stream API or a throughput benchmark.
+- The 2048-byte receive queue can overflow. TX accepts at most 64 data bytes and
+  waits for endpoint completion within the supplied deadline. A full packet is
+  followed by a completion-driven zero-length packet (ZLP), whose completion is
+  also awaited. Success confirms USB endpoint completion, not application receipt.
+  Timeout means delivery is unknown; pending state is retained, preventing reuse
+  until completion. USB suspend makes the session terminal; drop and recreate it.
+  This is not an application-level reliable stream or a throughput benchmark.
 
 ## Bounded diagnostic
 
@@ -47,8 +51,9 @@ to run the example. Use a dedicated test filename and leave existing apps intact
 5. Send exactly 256 synthetic bytes. Async reception counts bytes, regardless
    of USB packet boundaries or stream-buffer chunking. Expect eight reply bytes:
    ASCII `CDC!` followed by the count as a little-endian `u32`. Require count 256.
-   Send nothing else. The app allows 100 ms for that reply then restores USB.
-6. At most 35 seconds after launch (plus 100 ms response grace), the app drops the
+   Send nothing else. The app awaits endpoint completion before restoring USB.
+6. At most 35 seconds after launch plus its bounded final one-second TX wait,
+   the app drops the
    receiver, joins its worker, and restores the original interface, even if the
    host never completes the protocol. Reopen the original CLI, verify it responds,
    and verify the app is no longer running. Repeat twice.
@@ -97,3 +102,20 @@ for the next outer wait. Drop already detaches the producer before joining;
 this change improves response to cancellation within the bounded backlog rather
 than fixing an established unbounded-producer hang. No simulated scheduling test
 is claimed; interrupt and worker behavior still require on-device acceptance.
+
+## Hardware findings motivating completion handling
+
+Controlled dual-port tests established that firmware caches DTR only when a
+nonnull callback table exists. Installing that table before enumeration fixed
+synchronous payload loss. Subsequent tests echoed 1, 7, and 63 bytes exactly, but a
+64-byte packet did not terminate the host read. The firmware CLI implements the
+same necessary rule: after a full 64-byte data completion, submit a ZLP if there
+is no further data. The revised TX state machine implements that rule and awaits
+both completions; its hardware acceptance remains pending. All those earlier
+bounded runs restored the original CLI. These findings do not establish single
+mode, sustained throughput, or disconnect recovery.
+
+`python3 scripts/check-cdc-tx.py` runs host tests against the actual atomic TX
+state module: initial enumeration, short packet, full packet plus ZLP, retained
+unknown pending transfer, and terminal disconnect. These are transition tests,
+not simulations of USB hardware or interrupt timing.

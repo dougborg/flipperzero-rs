@@ -37,7 +37,9 @@ def main():
         ready = b"CDC-ASYNC-256\n"
         if read_exact(port, len(ready)) != ready:
             raise RuntimeError("async readiness mismatch")
-        port.write(bytes(range(256)))
+        # Two 128-byte host writes exercise splitting into 64-byte USB packets.
+        port.write(bytes(range(128)))
+        port.write(bytes(range(128, 256)))
         reply = read_exact(port, 8)
         if reply[:4] != b"CDC!" or struct.unpack("<I", reply[4:])[0] != 256:
             raise RuntimeError(f"async count mismatch: {reply!r}")

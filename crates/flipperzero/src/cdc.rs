@@ -6,7 +6,7 @@
 use core::ffi::c_void;
 use core::num::NonZero;
 use core::ptr;
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 use crate::furi::stream_buffer::StreamBuffer;
 use crate::furi::thread::{self, ThreadId};
@@ -14,6 +14,9 @@ use crate::furi::time::FuriDuration;
 use crate::{debug, trace};
 use flipperzero_sys::{self as sys};
 use sys::furi::FuriBox;
+
+mod tx_progress;
+use tx_progress::TxProgress;
 
 /// USB CDC operating mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,15 +32,20 @@ pub enum CdcMode {
 pub enum Error {
     /// USB mode switch is locked by another component.
     UsbLocked,
+    /// No active DTR session, or the USB session suspended. Recreate after suspend.
+    Disconnected,
+    /// Completion was not observed before the deadline; delivery is unknown.
+    /// Pending endpoint state is retained and cannot be overwritten by another TX.
+    CompletionTimeout,
 }
 
 // The firmware updates its cached DTR/RTS state only when a non-null callback
 // table is installed. Keep one installed even for synchronous-only sessions.
 // Static storage survives enumeration and every synchronous method call.
 static IDLE_CALLBACKS: sys::CdcCallbacks = sys::CdcCallbacks {
-    tx_ep_callback: None,
+    tx_ep_callback: Some(idle_tx_callback),
     rx_ep_callback: None,
-    state_callback: None,
+    state_callback: Some(idle_state_callback),
     ctrl_line_callback: None,
     config_callback: None,
 };
@@ -49,6 +57,13 @@ static IDLE_CALLBACKS: sys::CdcCallbacks = sys::CdcCallbacks {
 pub struct UsbCdc {
     if_num: u8,
     prev_config: *mut sys::FuriHalUsbInterface,
+    tx_state: FuriBox<TxState>,
+}
+
+struct TxState {
+    progress: TxProgress,
+    changing_callbacks: AtomicBool,
+    if_num: u8,
 }
 
 impl UsbCdc {
@@ -64,8 +79,8 @@ impl UsbCdc {
     /// The caller must exclusively coordinate USB configuration with all other firmware
     /// components for the entire handle lifetime. HAL's check/switch/lock operations are
     /// separate calls, not an atomic ownership claim. The selected CDC channel must have
-    /// no existing callbacks or users (in single mode, explicitly stop the firmware CLI
-    /// first). The previous interface must support restoration with a null context;
+    /// no existing callbacks, pending endpoint transfers, or users (in single mode,
+    /// explicitly stop the firmware CLI first). The previous interface must support restoration with a null context;
     /// HAL exposes no getter for its original context. The caller must restore any CLI
     /// session it stopped after dropping this handle. Do not unload the application
     /// while a leaked handle or receiver is still active.
@@ -82,16 +97,23 @@ impl UsbCdc {
                 CdcMode::Dual => (&raw mut sys::usb_cdc_dual, 1),
             };
 
+            let mut tx_state = FuriBox::new(TxState {
+                progress: TxProgress::new(prev_config != usb_if),
+                changing_callbacks: AtomicBool::new(false),
+                if_num,
+            });
+            let tx_ptr = FuriBox::as_mut_ptr(&mut tx_state);
             // Install before enumeration: SET_CONTROL_LINE_STATE can arrive as
             // soon as the host opens the newly exposed interface. The constructor
             // contract guarantees this channel has no previous callback owner.
             set_callbacks(
                 if_num,
                 (&raw const IDLE_CALLBACKS).cast_mut(),
-                ptr::null_mut(),
+                tx_ptr.cast(),
+                tx_ptr,
             );
             if !sys::furi_hal_usb_set_config(usb_if, ptr::null_mut()) {
-                set_callbacks(if_num, ptr::null_mut(), ptr::null_mut());
+                set_callbacks(if_num, ptr::null_mut(), ptr::null_mut(), tx_ptr);
                 return Err(Error::UsbLocked);
             }
 
@@ -100,26 +122,65 @@ impl UsbCdc {
             Ok(UsbCdc {
                 if_num,
                 prev_config,
+                tx_state,
             })
         }
     }
 
-    /// Send data over USB CDC.
+    /// Send at most one 64-byte packet and wait for endpoint completion.
     ///
-    /// This submits one endpoint packet, not a reliable stream write. The caller must
-    /// wait for endpoint completion before submitting another packet; HAL does not
-    /// report whether a busy/disconnected endpoint accepted the data.
+    /// Full packets receive a zero-length terminator after their data completion.
+    /// Success includes that terminator's completion, not host application receipt.
+    /// The timeout bounds waiting for both a previous pending transfer and this one.
+    /// A timeout leaves delivery unknown and retains pending state. A suspended USB
+    /// session is terminal: recreate it instead of treating reconnect as completion.
+    /// Call from thread context with interrupts and the scheduler enabled.
     ///
     /// # Panics
     ///
-    /// Panics if `data.len()` exceeds the 64-byte full-speed bulk endpoint size.
-    pub fn tx(&self, data: &[u8]) {
+    /// Panics if `data.len()` exceeds 64 bytes.
+    pub fn tx(&self, data: &[u8], timeout: FuriDuration) -> Result<(), Error> {
         assert!(
             data.len() <= CDC_WORKER_BUFFER_LEN,
             "CDC packet exceeds 64 bytes"
         );
-        let len = data.len() as u16;
-        unsafe { sys::furi_hal_cdc_send(self.if_num, data.as_ptr() as *mut u8, len) }
+        let start = unsafe { sys::furi_get_tick() };
+        self.wait_tx(start, timeout)?;
+        if !self.ctrl_line_state().dtr() {
+            return Err(Error::Disconnected);
+        }
+        // Exclude completion/suspend while claiming the endpoint and submitting.
+        // HAL copies the payload synchronously into packet memory; no slice is retained.
+        unsafe {
+            let critical = sys::__furi_critical_enter();
+            let claimed = self
+                .tx_state
+                .progress
+                .begin(data.len() == CDC_WORKER_BUFFER_LEN);
+            if claimed {
+                sys::furi_hal_cdc_send(self.if_num, data.as_ptr().cast_mut(), data.len() as u16);
+            }
+            sys::__furi_critical_exit(critical);
+            if !claimed {
+                return Err(Error::Disconnected);
+            }
+        }
+        self.wait_tx(start, timeout)
+    }
+
+    fn wait_tx(&self, start: u32, timeout: FuriDuration) -> Result<(), Error> {
+        loop {
+            if self.tx_state.progress.disconnected() {
+                return Err(Error::Disconnected);
+            }
+            if self.tx_state.progress.idle() {
+                return Ok(());
+            }
+            if unsafe { sys::furi_get_tick() }.wrapping_sub(start) >= timeout.as_ticks() {
+                return Err(Error::CompletionTimeout);
+            }
+            unsafe { sys::furi_delay_tick(1) };
+        }
     }
 
     /// Receive data from USB CDC.
@@ -179,7 +240,14 @@ impl UsbCdc {
 impl Drop for UsbCdc {
     fn drop(&mut self) {
         // Clear CDC callbacks so they no longer reference any context.
-        unsafe { set_callbacks(self.if_num, ptr::null_mut(), ptr::null_mut()) };
+        unsafe {
+            set_callbacks(
+                self.if_num,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                FuriBox::as_ptr(&self.tx_state),
+            )
+        };
 
         // Unlock and restore the previous USB configuration.
         unsafe {
@@ -345,6 +413,7 @@ struct Context<F: FnMut(&[u8]) + Send + 'static> {
     worker_thread: AtomicPtr<sys::FuriThread>,
     if_num: u8,
     cdc_callbacks: sys::CdcCallbacks,
+    tx_state: *const TxState,
 }
 
 impl<F> AsyncCdcReceiver<F>
@@ -354,8 +423,8 @@ where
     /// Submit one endpoint packet while async reception is active.
     ///
     /// This has the same size and delivery limitations as [`UsbCdc::tx`].
-    pub fn tx(&self, data: &[u8]) {
-        self.usb_cdc.tx(data);
+    pub fn tx(&self, data: &[u8], timeout: FuriDuration) -> Result<(), Error> {
+        self.usb_cdc.tx(data, timeout)
     }
 
     fn new(usb_cdc: UsbCdc, on_rx: F) -> Self {
@@ -366,10 +435,11 @@ where
             on_rx,
             worker_thread: AtomicPtr::new(ptr::null_mut()),
             if_num: usb_cdc.if_num,
+            tx_state: FuriBox::as_ptr(&usb_cdc.tx_state),
             cdc_callbacks: sys::CdcCallbacks {
-                tx_ep_callback: None,
+                tx_ep_callback: Some(async_tx_callback::<F>),
                 rx_ep_callback: Some(cdc_rx_callback::<F>),
-                state_callback: None,
+                state_callback: Some(async_state_callback::<F>),
                 ctrl_line_callback: None,
                 config_callback: None,
             },
@@ -401,6 +471,7 @@ where
                 usb_cdc.if_num,
                 &raw mut (*context_ptr).cdc_callbacks,
                 context_ptr.cast(),
+                FuriBox::as_ptr(&usb_cdc.tx_state),
             );
         }
 
@@ -412,7 +483,12 @@ impl<F: FnMut(&[u8]) + Send + 'static> Drop for AsyncCdcReceiver<F> {
     fn drop(&mut self) {
         // Clear the callback so it no longer references `Context`.
         unsafe {
-            set_callbacks(self.usb_cdc.if_num, ptr::null_mut(), ptr::null_mut());
+            set_callbacks(
+                self.usb_cdc.if_num,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                FuriBox::as_ptr(&self.usb_cdc.tx_state),
+            );
         }
 
         // SAFETY: Worker thread is still running, so be careful not to create a reference to `Context`.
@@ -505,16 +581,63 @@ unsafe extern "C" fn async_cdc_receiver_worker<F: FnMut(&[u8]) + Send + 'static>
     0
 }
 
-// SAFETY: Only used for the exclusively owned CDC channel. Both the old and new
-// callback sets are ours (or null); our state/control callbacks are absent and
-// therefore registration cannot block. On the single-core STM32WB application
-// CPU, the critical section excludes USB interrupts and task switches so an
-// interrupt cannot observe a new callback pointer paired with the old context,
-// and unregister returns after all prior callbacks have finished.
-unsafe fn set_callbacks(if_num: u8, callbacks: *mut sys::CdcCallbacks, context: *mut c_void) {
+// SAFETY: Only our callbacks (or null) occupy the exclusively owned channel.
+// Our state callback performs atomic operations only, so the HAL's synchronous
+// notification cannot block inside the critical section. Callback replacement
+// invokes synthetic disconnect/connect notifications; suppress only those while
+// USB interrupts and task switches are excluded. Actual suspend makes TX terminal.
+// Detach returns after any prior ISR callback has finished, before storage is freed.
+unsafe fn set_callbacks(
+    if_num: u8,
+    callbacks: *mut sys::CdcCallbacks,
+    context: *mut c_void,
+    tx: *const TxState,
+) {
     unsafe {
         let critical = sys::__furi_critical_enter();
+        (*tx).changing_callbacks.store(true, Ordering::Release);
         sys::furi_hal_cdc_set_callbacks(if_num, callbacks, context);
+        (*tx).changing_callbacks.store(false, Ordering::Release);
         sys::__furi_critical_exit(critical);
+    }
+}
+
+unsafe fn tx_complete(tx: *const TxState) {
+    unsafe {
+        if (*tx).progress.complete() {
+            // The USB driver clears the completion flag before calling us. Its
+            // PMA write is synchronous and nonblocking, including from this ISR.
+            sys::furi_hal_cdc_send((*tx).if_num, ptr::null_mut(), 0);
+        }
+    }
+}
+unsafe fn tx_state_changed(tx: *const TxState, state: sys::CdcState) {
+    unsafe {
+        if state != sys::CdcStateConnected && !(*tx).changing_callbacks.load(Ordering::Acquire) {
+            (*tx).progress.suspend();
+        }
+    }
+}
+unsafe extern "C" fn idle_tx_callback(context: *mut c_void) {
+    unsafe {
+        tx_complete(context.cast());
+    }
+}
+unsafe extern "C" fn idle_state_callback(context: *mut c_void, state: sys::CdcState) {
+    unsafe {
+        tx_state_changed(context.cast(), state);
+    }
+}
+unsafe extern "C" fn async_tx_callback<F: FnMut(&[u8]) + Send + 'static>(context: *mut c_void) {
+    unsafe {
+        tx_complete((*context.cast::<Context<F>>()).tx_state);
+    }
+}
+unsafe extern "C" fn async_state_callback<F: FnMut(&[u8]) + Send + 'static>(
+    context: *mut c_void,
+    state: sys::CdcState,
+) {
+    unsafe {
+        tx_state_changed((*context.cast::<Context<F>>()).tx_state, state);
     }
 }
