@@ -31,6 +31,15 @@ also conservatively left pending. Reload the session after an unrecoverable
 transport failure; do not retry an unknown-delivery packet blindly. Peer reset
 is sticky and requires dropping/recreating the session.
 
+Credits belong to the running profile, not an individual central connection.
+The flow characteristic holds the last full grant, not the remaining balance.
+A reconnecting client must preserve its outstanding credit balance, or reconnect
+at a known fully replenished boundary; rereading the characteristic after an
+arbitrary disconnect is not a fresh grant. Drop/recreate the profile when a fresh
+session is required. Reconnect with an outstanding unconfirmed indication is not
+claimed: the example exits on confirmation timeout instead of resending unknown
+bytes. Wait for the final indication acknowledgement before an idle reconnect.
+
 ## Lifecycle reviewed against Momentum mntm-012
 
 Exact firmware commit: `e1784e7418d8b074e971983ceb6fef0f37e52ae4`, API87.1.
